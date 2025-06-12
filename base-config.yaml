@@ -16,4 +16,11 @@ youtube:
 tiktok:
   enabled: True
   video: True
+activitypub:
+  enabled: True
+  info: True
+  image: True
+  video: True
+  audio: True
+  file: True
 respond_to_notice: False

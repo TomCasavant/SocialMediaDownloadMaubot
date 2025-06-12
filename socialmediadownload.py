@@ -29,7 +29,7 @@ reddit_pattern = re.compile(r"((?:https?:)?\/\/)?((?:www|m|old|nm)\.)?((?:reddit
 instagram_pattern = re.compile(r"(?:https?:\/\/)?(?:www\.)?instagram\.com\/?([a-zA-Z0-9\.\_\-]+)?\/([p]+)?([reel]+)?([tv]+)?([stories]+)?\/([a-zA-Z0-9\-\_\.]+)\/?([0-9]+)?")
 youtube_pattern = re.compile(r"((?:https?:)?\/\/)?((?:www|m)\.)?((?:youtube\.com|youtu\.be))(\/(?:[\w\-]+\?v=|embed\/|v\/)?)([\w\-]+)(\S+)?")
 tiktok_pattern = re.compile(r"((?:https?:)?\/\/)?((?:www|m|vm)\.)?((?:tiktok\.com))(\/[@a-zA-Z0-9\-\_\.]+)?(\/video\/)?([a-zA-Z0-9\-\_]+)?")
-
+url_pattern = re.compile(r"https?://[^\s<>\"']+")
 
 class SocialMediaDownloadPlugin(Plugin):
     async def start(self) -> None:
@@ -40,32 +40,47 @@ class SocialMediaDownloadPlugin(Plugin):
         return Config
 
     @event.on(EventType.ROOM_MESSAGE)
-    async def on_message(self, evt: MessageEvent) -> None:
+    async def on_message(self, evt: MessageEvent) -> None:      
         if (evt.content.msgtype != MessageType.TEXT and
         not (self.config["respond_to_notice"] and evt.content.msgtype == MessageType.NOTICE) or
         evt.content.body.startswith("!")):
             return
 
+        matched_urls = set()
 
         for url_tup in youtube_pattern.findall(evt.content.body):
             await evt.mark_read()
+            matched_urls.add("".join(url_tup))
             if self.config["youtube.enabled"]:
                 await self.handle_youtube(evt, url_tup)
 
         for url_tup in instagram_pattern.findall(evt.content.body):
             await evt.mark_read()
+            matched_urls.add("".join(url_tup))
             if self.config["instagram.enabled"] and url_tup[5]:
                 await self.handle_instagram(evt, url_tup)
 
         for url_tup in reddit_pattern.findall(evt.content.body):
             await evt.mark_read()
+            matched_urls.add("".join(url_tup))
             if self.config["reddit.enabled"]:
                 await self.handle_reddit(evt, url_tup)
 
         for url_tup in tiktok_pattern.findall(evt.content.body):
             await evt.mark_read()
+            matched_urls.add("".join(url_tup))
             if self.config["tiktok.enabled"]:
                 await self.handle_tiktok(evt, url_tup)
+
+        if self.config["activitypub.enabled"]:
+            for url_tup in url_pattern.findall(evt.content.body):
+                url = "".join(url_tup)
+                if url not in matched_urls:
+                    await evt.mark_read()
+                    if await self.supports_activitypub(url):
+                        await self.handle_activitypub(evt, url_tup)
+
+        
 
     async def get_ttdownloader_params(self, tokensDict, url) -> list:
         cookies = {
@@ -311,3 +326,161 @@ class SocialMediaDownloadPlugin(Plugin):
             elif self.config["reddit.image"] or self.config["reddit.video"]:
                 self.log.warning(f"Unknown media type {query_url}: {mime_type}")
                 return
+
+    async def supports_activitypub(self, url):
+        headers = {
+            "Accept": "application/activity+json",
+            "User-Agent": "ggogel/SocialMediaDownloadMaubot"
+        }
+    
+        try:
+            async with self.http.head(url, headers=headers, allow_redirects=True, timeout=5) as response:
+                if response.status in [405, 403, 400]:
+                    # If HEAD not allowed or forbidden, try GET
+                    async with self.http.get(url, headers=headers, timeout=5) as response_get:
+                        content_type = response_get.headers.get("Content-Type", "")
+                        return "application/activity+json" in content_type.lower()
+    
+                content_type = response.headers.get("Content-Type", "")
+                return "application/activity+json" in content_type.lower()
+        except Exception:
+            return False
+
+    async def handle_activitypub(self, evt, url_tup):
+        url = ''.join(url_tup).split('?')[0]
+        headers = {
+            "Accept": "application/activity+json",
+            "User-Agent": "ggogel/SocialMediaDownloadMaubot"
+        }
+
+        try:
+            async with self.http.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    self.log.warning(f"Failed to fetch ActivityPub object {url}: HTTP {resp.status}")
+                    return
+
+                ap_json = await resp.json()
+
+                content = ap_json.get("content", None)
+                attachments = []
+
+                for item in ap_json.get("attachment", []):
+                    attachment_url = item.get("url")
+                    mimetype = item.get("mediaType")
+                    if attachment_url and mimetype:
+                        attachments.append((attachment_url, mimetype))
+
+                if content and self.config["activitypub.info"]:
+                    await evt.reply(
+                        TextMessageEventContent(
+                            msgtype=MessageType.TEXT,
+                            format=Format.HTML,
+                            body=content,
+                            formatted_body=content
+                        )
+                    )
+
+                for attachment_url, mimetype in attachments:
+                    try:
+                        if "image" in mimetype:
+                            if not self.config["activitypub.image"]:
+                                continue
+                            msgtype = MessageType.IMAGE
+                        elif "video" in mimetype:
+                            if not self.config["activitypub.video"]:
+                                continue
+                            msgtype = MessageType.VIDEO
+                        elif "audio" in mimetype:
+                            if not self.config["activitypub.audio"]:
+                                continue
+                            msgtype = MessageType.AUDIO
+                        else:
+                            if not self.config["activitypub.file"]:
+                                continue
+                            msgtype = MessageType.FILE
+
+                        async with self.http.get(attachment_url) as media_resp:
+                            if media_resp.status != 200:
+                                self.log.warning(f"Failed to download attachment {attachment_url}: HTTP {media_resp.status}")
+                                continue
+                            media_bytes = await media_resp.read()
+
+                        filename = attachment_url.split("/")[-1].split("?")[0]
+                        file_info = BaseFileInfo(mimetype=mimetype, size=len(media_bytes))
+                        uri = await self.client.upload_media(media_bytes, mime_type=mimetype, filename=filename)
+
+
+                        await self.client.send_file(
+                            evt.room_id,
+                            url=uri,
+                            info=file_info,
+                            file_name=filename,
+                            file_type=msgtype
+                        )
+
+                    except Exception as e:
+                        self.log.warning(f"Error sending attachment {attachment_url}: {e}")
+
+        except Exception as e:
+            self.log.warning(f"Error fetching ActivityPub object {url}: {e}")
+
+    async def handle_activitypub(self, evt, url_tup):
+        accepted_mimetypes = ["image/jpeg", "image/png"]
+        url = ''.join(url_tup).split('?')[0]
+        headers = {
+            "Accept": "application/activity+json",
+            "User-Agent": "ggogel/SocialMediaDownloadMaubot"
+        }
+
+        try:
+            async with self.http.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    self.log.warning(f"Failed to fetch ActivityPub object {url}: HTTP {resp.status}")
+                    return
+
+                ap_json = await resp.json()
+
+                content = ap_json.get("content", None)
+                attachments = []
+
+                for item in ap_json.get("attachment", []):
+                    attachment_url = item.get("url")
+                    mimetype = item.get("mediaType")
+                    if attachment_url and mimetype in accepted_mimetypes:
+                        attachments.append((attachment_url, mimetype))
+
+                if content:
+                    await evt.reply(
+                        TextMessageEventContent(
+                            msgtype=MessageType.TEXT,
+                            format=Format.HTML,
+                            body=content,
+                            formatted_body=content
+                        )
+                    )
+
+                for attachment_url, mimetype in attachments:
+                    try:
+                        async with self.http.get(attachment_url) as media_resp:
+                            if media_resp.status != 200:
+                                self.log.warning(f"Failed to download attachment {attachment_url}: HTTP {media_resp.status}")
+                                continue
+                            media_bytes = await media_resp.read()
+
+                        filename = attachment_url.split("/")[-1].split("?")[0]
+                        file_info = BaseFileInfo(mimetype=mimetype, size=len(media_bytes))
+
+                        uri = await self.client.upload_media(media_bytes, mime_type=mimetype, filename=filename)
+
+                        await self.client.send_file(
+                            evt.room_id,
+                            url=uri,
+                            info=file_info,
+                            file_name=filename,
+                            file_type=MessageType.IMAGE
+                        )
+                    except Exception as e:
+                        self.log.warning(f"Error sending attachment {attachment_url}: {e}")
+
+        except Exception as e:
+            self.log.warning(f"Error fetching ActivityPub object {url}: {e}")
